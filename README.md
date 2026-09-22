@@ -68,40 +68,46 @@ The best tile depends on the chip (core count, bandwidth, cache), the dtype and 
 
 Same flags on M5 and M6. The compute-bound square and fat rows are the ones that show a datapath difference. The thin row is one token and is much closer to bandwidth.
 
-## M5 base (Mac17,2, 32 GB)
+## M5 base (Mac17,2, 10-core GPU, 32 GB)
 
-Measured with `./run.sh` before the tile change, so every row used the 64x32 tile. Needs a rerun with the current defaults. Ratios are versus FP16 on the same shape. This kernel is a 64×32 `matmul2d` tile, not a tuned peak.
+Measured with `./run.sh --autotune`. The winning tiles are in `profiles/apple-m5-applegpu-g17g.json`.
 
 ```
-shape         N      K      M dtype      median_ms   tflops  vs_fp16    ref_rel
-----------------------------------------------------------------------------
-square     4096   4096   4096 fp16         24.3074    5.654    1.000   2.18e-06
-square     4096   4096   4096 int8         23.9190    5.746    1.016          0
-square     4096   4096   4096 i8i8         12.1736   11.290    1.997          0
-square     4096   4096   4096 fp8          23.7812    5.779    1.022   1.06e-06
-square     4096   4096   4096 f8f8         16.8176    8.172    1.445          0
-square     4096   4096   4096 f4f4         19.1436    7.179    1.270          0
-square     4096   4096   4096 mxfp4        24.2804    5.660    1.001          0
-square     4096   4096   4096 mxfp4/a4     31.1310    4.415    0.781          0
-thin          1   4096  11008 fp16          0.8878    0.102    1.000   7.18e-06
-thin          1   4096  11008 int8          0.7294    0.124    1.217          0
-thin          1   4096  11008 i8i8          0.4541    0.199    1.955          0
-thin          1   4096  11008 fp8           0.7270    0.124    1.221   3.22e-06
-thin          1   4096  11008 f8f8          0.7290    0.124    1.218          0
-thin          1   4096  11008 f4f4          0.8586    0.105    1.034          0
-thin          1   4096  11008 mxfp4         0.9870    0.091    0.899          0
-thin          1   4096  11008 mxfp4/a4      1.5695    0.057    0.566          0
-fat        2048   4096  11008 fp16         33.3715    5.534    1.000   7.73e-06
-fat        2048   4096  11008 int8         31.7764    5.812    1.050          0
-fat        2048   4096  11008 i8i8         16.4181   11.249    2.033          0
-fat        2048   4096  11008 fp8          31.5665    5.851    1.057   4.61e-06
-fat        2048   4096  11008 f8f8         22.6992    8.136    1.470          0
-fat        2048   4096  11008 f4f4         25.7573    7.170    1.296          0
-fat        2048   4096  11008 mxfp4        32.4321    5.694    1.029          0
-fat        2048   4096  11008 mxfp4/a4     41.6759    4.431    0.801          0
+shape         N      K      M dtype     tile    median_ms   tflops  vs_fp16    ref_rel
+--------------------------------------------------------------------------------------
+square     4096   4096   4096 fp16      64x128     9.6662   14.218    1.000    2.5e-06
+square     4096   4096   4096 int8      64x128    10.7680   12.764    0.898          0
+square     4096   4096   4096 i8i8      64x128     4.6654   29.459    2.072          0
+square     4096   4096   4096 fp8       64x128     8.6186   15.947    1.122   8.83e-07
+square     4096   4096   4096 f8f8      64x64      8.4068   16.348    1.150          0
+square     4096   4096   4096 f4f4      64x64      9.5737   14.356    1.010          0
+square     4096   4096   4096 mxfp4     64x64     12.4735   11.018    0.775          0
+square     4096   4096   4096 mxfp4/a4  64x64     15.5203    8.855    0.623          0
+square     4096   4096   4096 mxfp4/a8  64x64     16.9317    8.117    0.571          0
+square     4096   4096   4096 mxfp4/f8  64x64     14.2862    9.620    0.677          0
+thin          1   4096  11008 fp16      64x128     0.7850    0.115    1.000   8.46e-06
+thin          1   4096  11008 int8      8x32       0.4038    0.223    1.944          0
+thin          1   4096  11008 i8i8      16x32      0.4074    0.221    1.927          0
+thin          1   4096  11008 fp8       8x32       0.4063    0.222    1.932   3.22e-06
+thin          1   4096  11008 f8f8      16x32      0.4055    0.222    1.936          0
+thin          1   4096  11008 f4f4      16x64      0.2261    0.399    3.471          0
+thin          1   4096  11008 mxfp4     16x32      0.2586    0.349    3.036          0
+thin          1   4096  11008 mxfp4/a4  8x32       0.3139    0.287    2.501          0
+thin          1   4096  11008 mxfp4/a8  8x64       0.4122    0.219    1.904          0
+thin          1   4096  11008 mxfp4/f8  8x64       0.3665    0.246    2.142          0
+fat        2048   4096  11008 fp16      64x128    12.9369   14.276    1.000   8.46e-06
+fat        2048   4096  11008 int8      64x128    14.8564   12.431    0.871          0
+fat        2048   4096  11008 i8i8      64x128     6.2833   29.393    2.059          0
+fat        2048   4096  11008 fp8       64x128    11.7999   15.651    1.096   4.61e-06
+fat        2048   4096  11008 f8f8      64x64     11.2144   16.468    1.154          0
+fat        2048   4096  11008 f4f4      64x64     12.8756   14.344    1.005          0
+fat        2048   4096  11008 mxfp4     64x64     16.7059   11.055    0.774          0
+fat        2048   4096  11008 mxfp4/a4  64x64     20.7450    8.903    0.624          0
+fat        2048   4096  11008 mxfp4/a8  64x64     22.6384    8.158    0.571          0
+fat        2048   4096  11008 mxfp4/f8  64x64     19.0987    9.670    0.677          0
 ```
 
-On this M5, `i8i8` is about 2× FP16. `f8f8` is about 1.45× and unscaled `f4f4` about 1.27×. Half-activation rows (`int8`, `fp8`, `mxfp4`) stay near 1× on the square. `mxfp4/a4` is slower than FP16.
+On this base M5 the autotuned tile lifts square FP16 from 5.7 TFLOPS (64×32) to 14.2 (64×128). `i8i8` is 2.07× (29.5 TOPS). `fp8` and `f8f8` are 1.12–1.15× FP16 on the square; unscaled `f4f4` matches FP16 there (1.01×) and is the fastest thin row (3.47×). Half × int8 is 0.90× FP16 on the square and 1.94× on thin. MXFP4 is slower than FP16 on square and fat (`mxfp4` 0.78×, `mxfp4/a4` 0.62×, `mxfp4/f8` 0.68×, `mxfp4/a8` 0.57×) and faster on thin (`mxfp4` 3.04×, `mxfp4/a4` 2.50×, `mxfp4/f8` 2.14×, `mxfp4/a8` 1.90×). Square and fat agree, so the float path here is about 14 TFLOPS for FP16, about 16 for FP8×FP8, and about 29 TOPS for int8×int8.
 
 ## M5 Max (Mac17,6, 40-core GPU, 128 GB)
 
