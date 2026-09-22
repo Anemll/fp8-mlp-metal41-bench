@@ -11,7 +11,7 @@ func floatToE4M3(_ x: Float) -> UInt8 {
     if ax >= 448 { return sign | 0x7E }
     let bits = ax.bitPattern
     let exp = Int((bits >> 23) & 0xFF) - 127
-    var mant = bits & 0x7FFFFF
+    let mant = bits & 0x7FFFFF
     var e = exp + 7
     if e <= 0 { return sign }
     if e >= 15 { return sign | 0x7E }
@@ -26,13 +26,110 @@ func floatToE4M3(_ x: Float) -> UInt8 {
     return sign | UInt8((e << 3) | Int(m3))
 }
 
+// Decode the stored E4M3FN byte (including subnormals). NaN -> NaN.
+func e4m3ToFloat(_ b: UInt8) -> Float {
+    let sign: Float = (b & 0x80) != 0 ? -1 : 1
+    let exp = Int((b >> 3) & 0x0F)
+    let mant = Int(b & 0x07)
+    if exp == 0 {
+        return sign * Float(mant) * exp2(-9)
+    }
+    if exp == 15 && mant == 7 {
+        return Float.nan
+    }
+    return sign * (1 + Float(mant) / 8) * exp2(Float(exp - 7))
+}
+
+// OCP E2M1: 1 sign, 2 exp, 1 mantissa, bias 1. Finite set is 0, 0.5, 1, 1.5, 2, 3, 4, 6.
+func e2m1ToFloat(_ nibble: UInt8) -> Float {
+    let mag: [Float] = [0, 0.5, 1, 1.5, 2, 3, 4, 6]
+    let sign: Float = (nibble & 0x8) != 0 ? -1 : 1
+    return sign * mag[Int(nibble & 0x7)]
+}
+
+func e2m1Code(_ i: Int) -> UInt8 {
+    let codes: [UInt8] = [0x0, 0x1, 0x2, 0x3, 0x4, 0x5, 0x6, 0x9, 0xA, 0xC]
+    return codes[i % codes.count]
+}
+
+// Low nibble is the even element.
+func packE2M1(_ count: Int, _ code: (Int) -> UInt8) -> [UInt8] {
+    var bytes = [UInt8](repeating: 0, count: count / 2)
+    for i in 0..<count {
+        let nibble = code(i) & 0xF
+        if i % 2 == 0 {
+            bytes[i / 2] |= nibble
+        } else {
+            bytes[i / 2] |= nibble << 4
+        }
+    }
+    return bytes
+}
+
+func e2m1At(_ bytes: [UInt8], _ index: Int) -> Float {
+    let byte = bytes[index / 2]
+    let nibble = (index % 2 == 0) ? (byte & 0xF) : (byte >> 4)
+    return e2m1ToFloat(nibble)
+}
+
+// OCP UE8M0: scale = 2^(byte - 127). One scale covers 32 elements along K.
+func ue8m0ToFloat(_ code: UInt8) -> Float {
+    exp2(Float(Int(code) - 127))
+}
+
+func ue8m0Code(_ i: Int) -> UInt8 {
+    let codes: [UInt8] = [125, 126, 127, 128]
+    return codes[i % codes.count]
+}
+
+enum DType: String, CaseIterable {
+    case fp16
+    case int8
+    case i8i8
+    case fp8
+    case f8f8
+    case f4f4
+    case mxfp4
+    case mx4x4 = "mxfp4/a4"
+
+    var kernel: String {
+        switch self {
+        case .fp16: return "fp16_mlp_gemm"
+        case .int8: return "int8_mlp_gemm"
+        case .i8i8: return "i8i8_mlp_gemm"
+        case .fp8: return "fp8_mlp_gemm"
+        case .f8f8: return "f8f8_mlp_gemm"
+        case .f4f4: return "f4f4_mlp_gemm"
+        case .mxfp4: return "mxfp4_mlp_gemm"
+        case .mx4x4: return "mx4x4_mlp_gemm"
+        }
+    }
+}
+
+struct ShapeCase {
+    var name: String
+    var N: Int
+    var K: Int
+    var M: Int
+    var iters: Int
+}
+
 struct Args {
     var N = 4096
     var K = 4096
     var M = 4096
-    var iters = 50
+    var iters = 100
     var warmup = 5
+    var dtypes: [DType] = Array(DType.allCases)
+    var suite = false
+    var shapeSet = false
 }
+
+let suiteShapes = [
+    ShapeCase(name: "square", N: 4096, K: 4096, M: 4096, iters: 100),
+    ShapeCase(name: "thin", N: 1, K: 4096, M: 11008, iters: 200),
+    ShapeCase(name: "fat", N: 2048, K: 4096, M: 11008, iters: 50),
+]
 
 func parseArgs() -> Args {
     var a = Args()
@@ -40,14 +137,32 @@ func parseArgs() -> Args {
     var i = 1
     while i < argv.count {
         let key = argv[i]
+        if key == "--suite" {
+            a.suite = true
+            i += 1
+            continue
+        }
         i += 1
         guard i < argv.count else { break }
+        if key == "--dtype" {
+            let name = argv[i]
+            i += 1
+            if name == "all" {
+                a.dtypes = Array(DType.allCases)
+            } else if let dtype = DType(rawValue: name) {
+                a.dtypes = [dtype]
+            } else {
+                fputs("Unknown --dtype \(name) (fp16, int8, i8i8, fp8, f8f8, f4f4, mxfp4, mxfp4/a4, all)\n", stderr)
+                exit(1)
+            }
+            continue
+        }
         let val = Int(argv[i]) ?? 0
         switch key {
-        case "--N": a.N = val
-        case "--K": a.K = val
-        case "--M": a.M = val
-        case "--iters": a.iters = val
+        case "--N": a.N = val; a.shapeSet = true
+        case "--K": a.K = val; a.shapeSet = true
+        case "--M": a.M = val; a.shapeSet = true
+        case "--iters": a.iters = val; a.shapeSet = true
         case "--warmup": a.warmup = val
         default: break
         }
@@ -56,130 +171,367 @@ func parseArgs() -> Args {
     return a
 }
 
+func loadLibrary(device: MTLDevice) -> MTLLibrary {
+    let cwd = FileManager.default.currentDirectoryPath
+    let envPath = ProcessInfo.processInfo.environment["FP8_MLP_METALLIB"]
+    let libPath = envPath ?? URL(fileURLWithPath: cwd).appendingPathComponent("default.metallib").path
+    if FileManager.default.fileExists(atPath: libPath) {
+        do {
+            let library = try device.makeLibrary(URL: URL(fileURLWithPath: libPath))
+            print("loaded: \(libPath)")
+            return library
+        } catch {
+            fputs("Failed loading metallib: \(error)\n", stderr)
+            exit(2)
+        }
+    }
+
+    let srcURL = URL(fileURLWithPath: cwd).appendingPathComponent("fp8_mlp.metal")
+    guard let src = try? String(contentsOf: srcURL, encoding: .utf8) else {
+        fputs("Need FP8_MLP_METALLIB, default.metallib, or fp8_mlp.metal in \(cwd)\n", stderr)
+        exit(1)
+    }
+    let options = MTLCompileOptions()
+    options.languageVersion = .version4_1
+    do {
+        let library = try device.makeLibrary(source: src, options: options)
+        print("compiled from source (metal4.1): \(srcURL.path)")
+        return library
+    } catch {
+        fputs("Metal compile failed (need Metal 4.1 + FP8 matmul):\n\(error)\n", stderr)
+        exit(2)
+    }
+}
+
+func makePipeline(library: MTLLibrary, device: MTLDevice, name: String) -> MTLComputePipelineState {
+    guard let fn = library.makeFunction(name: name) else {
+        fputs("Missing kernel \(name)\n", stderr)
+        exit(1)
+    }
+    do {
+        return try device.makeComputePipelineState(function: fn)
+    } catch {
+        fputs("Pipeline \(name) failed: \(error)\n", stderr)
+        exit(1)
+    }
+}
+
+struct Row {
+    var shape: String
+    var N: Int
+    var K: Int
+    var M: Int
+    var dtype: DType
+    var medianMs: Double
+    var tflops: Double
+    var vsFp16: String
+    var refRel: Float
+}
+
 guard let device = MTLCreateSystemDefaultDevice() else {
     fputs("No Metal device\n", stderr)
     exit(1)
 }
 
 let args = parseArgs()
+let shapes: [ShapeCase] = (args.suite || !args.shapeSet)
+    ? suiteShapes
+    : [ShapeCase(name: "custom", N: args.N, K: args.K, M: args.M, iters: args.iters)]
+for shape in shapes {
+    guard shape.N > 0, shape.K > 0, shape.M > 0, shape.iters > 0 else {
+        fputs("N, K, M, iters must be > 0\n", stderr)
+        exit(1)
+    }
+}
+
 print("device: \(device.name)")
-print("shape: N=\(args.N) K=\(args.K) M=\(args.M)  (Y = X[N,K] @ W[K,M])")
-print("dtype: X=half  W=fp8_e4m3  Y=float")
+print("timing: gpu")
+print("dtypes: \(args.dtypes.map(\.rawValue).joined(separator: ","))")
+print("shapes: \(shapes.map { "\($0.name) N=\($0.N) K=\($0.K) M=\($0.M) iters=\($0.iters)" }.joined(separator: " | "))")
 
-let cwd = FileManager.default.currentDirectoryPath
-let libURL = URL(fileURLWithPath: cwd).appendingPathComponent("default.metallib")
-let srcURL = URL(fileURLWithPath: cwd).appendingPathComponent("fp8_mlp.metal")
+let library = loadLibrary(device: device)
+guard let queue = device.makeCommandQueue() else {
+    fputs("command queue alloc failed\n", stderr)
+    exit(1)
+}
 
-let library: MTLLibrary
-if FileManager.default.fileExists(atPath: libURL.path) {
-    do {
-        library = try device.makeLibrary(URL: libURL)
-        print("loaded: \(libURL.path)")
-    } catch {
-        fputs("Failed loading metallib: \(error)\n", stderr)
-        exit(2)
+var pipelines: [DType: MTLComputePipelineState] = [:]
+for dtype in args.dtypes {
+    pipelines[dtype] = makePipeline(library: library, device: device, name: dtype.kernel)
+}
+
+let tgM = 64, tgN = 32
+
+func bench(_ shape: ShapeCase) -> [Row] {
+    let N = shape.N, K = shape.K, M = shape.M
+    let xCount = N * K
+    let wCount = K * M
+    let yCount = N * M
+    var xHost = [Float16](repeating: 0, count: xCount)
+    var xInt8 = [Int8](repeating: 0, count: xCount)
+    var xFp8 = [UInt8](repeating: 0, count: xCount)
+    var wFp16 = [Float16](repeating: 0, count: wCount)
+    var wInt8 = [Int8](repeating: 0, count: wCount)
+    var wFp8 = [UInt8](repeating: 0, count: wCount)
+    let fp4OK = xCount % 2 == 0 && wCount % 2 == 0
+    let mxOK = fp4OK && K % 32 == 0
+    var xFp4 = fp4OK ? packE2M1(xCount) { e2m1Code($0) } : [UInt8(0)]
+    var wFp4 = fp4OK ? packE2M1(wCount) { e2m1Code($0 + 3) } : [UInt8(0)]
+    // MX weight is [M, K], so element m*K+k sits next to the rest of that row.
+    var wMx = mxOK ? packE2M1(wCount) { e2m1Code($0 + 5) } : [UInt8(0)]
+    let kBlocks = max(K / 32, 1)
+    var wScale = mxOK ? (0..<(M * kBlocks)).map { ue8m0Code($0) } : [UInt8(0)]
+    var xScale = mxOK ? (0..<(N * kBlocks)).map { ue8m0Code($0 + 1) } : [UInt8(0)]
+    for i in 0..<xCount {
+        let xf = Float((i % 97) - 48) * 0.02
+        xHost[i] = Float16(xf)
+        xInt8[i] = Int8((i % 97) - 48)
+        xFp8[i] = floatToE4M3(xf)
     }
-} else if let src = try? String(contentsOf: srcURL, encoding: .utf8) {
-    let options = MTLCompileOptions()
-    do {
-        library = try device.makeLibrary(source: src, options: options)
-        print("compiled from source: \(srcURL.path)")
-    } catch {
-        fputs("Metal compile failed (need Metal 4.1 + FP8 matmul):\n\(error)\n", stderr)
-        exit(2)
+    for i in 0..<wCount {
+        let f = Float((i % 53) - 26) * 0.05
+        wFp16[i] = Float16(f)
+        wInt8[i] = Int8(max(-128, min(127, Int((i % 53) - 26))))
+        wFp8[i] = floatToE4M3(f)
     }
-} else {
-    fputs("Need default.metallib or fp8_mlp.metal in \(cwd)\n", stderr)
-    exit(1)
-}
+    guard let xBuf = device.makeBuffer(bytes: &xHost, length: xCount * MemoryLayout<Float16>.size, options: .storageModeShared),
+          let xInt8Buf = device.makeBuffer(bytes: &xInt8, length: xCount, options: .storageModeShared),
+          let xFp8Buf = device.makeBuffer(bytes: &xFp8, length: xCount, options: .storageModeShared),
+          let xFp4Buf = device.makeBuffer(bytes: &xFp4, length: xFp4.count, options: .storageModeShared),
+          let wFp4Buf = device.makeBuffer(bytes: &wFp4, length: wFp4.count, options: .storageModeShared),
+          let wMxBuf = device.makeBuffer(bytes: &wMx, length: wMx.count, options: .storageModeShared),
+          let wScaleBuf = device.makeBuffer(bytes: &wScale, length: wScale.count, options: .storageModeShared),
+          let xScaleBuf = device.makeBuffer(bytes: &xScale, length: xScale.count, options: .storageModeShared),
+          let wFp16Buf = device.makeBuffer(bytes: &wFp16, length: wCount * MemoryLayout<Float16>.size, options: .storageModeShared),
+          let wInt8Buf = device.makeBuffer(bytes: &wInt8, length: wCount, options: .storageModeShared),
+          let wFp8Buf = device.makeBuffer(bytes: &wFp8, length: wCount, options: .storageModeShared),
+          let yBuf = device.makeBuffer(length: yCount * MemoryLayout<Float>.size, options: .storageModeShared)
+    else {
+        fputs("Buffer alloc failed for \(shape.name)\n", stderr)
+        exit(1)
+    }
 
-guard let fn = library.makeFunction(name: "fp8_mlp_gemm") else {
-    fputs("Missing kernel fp8_mlp_gemm\n", stderr)
-    exit(1)
-}
+    func weightBuffer(_ dtype: DType) -> MTLBuffer {
+        switch dtype {
+        case .fp16: return wFp16Buf
+        case .int8: return wInt8Buf
+        case .i8i8: return wInt8Buf
+        case .fp8: return wFp8Buf
+        case .f8f8: return wFp8Buf
+        case .f4f4: return wFp4Buf
+        case .mxfp4, .mx4x4: return wMxBuf
+        }
+    }
+    func refActivation(_ dtype: DType, _ i: Int) -> Float {
+        switch dtype {
+        case .fp16, .int8, .fp8: return Float(xHost[i])
+        case .i8i8: return Float(xInt8[i])
+        case .f8f8: return e4m3ToFloat(xFp8[i])
+        case .f4f4: return e2m1At(xFp4, i)
+        case .mxfp4: return Float(xHost[i])
+        case .mx4x4:
+            let block = K / 32
+            let n = i / K
+            let k = i % K
+            return e2m1At(xFp4, i) * ue8m0ToFloat(xScale[n * block + k / 32])
+        }
+    }
+    func refWeight(_ dtype: DType, _ k: Int, _ m: Int) -> Float {
+        let i = k * M + m
+        switch dtype {
+        case .fp16: return Float(wFp16[i])
+        case .int8: return Float(wInt8[i])
+        case .i8i8: return Float(wInt8[i])
+        case .fp8, .f8f8: return e4m3ToFloat(wFp8[i])
+        case .f4f4: return e2m1At(wFp4, i)
+        case .mxfp4, .mx4x4:
+            let block = K / 32
+            return e2m1At(wMx, m * K + k) * ue8m0ToFloat(wScale[m * block + k / 32])
+        }
+    }
 
-let pipeline: MTLComputePipelineState
-do {
-    pipeline = try device.makeComputePipelineState(function: fn)
-} catch {
-    fputs("Pipeline failed: \(error)\n", stderr)
-    exit(1)
-}
+    var samples = [(Int, Int)]()
+    func addSample(_ n: Int, _ m: Int) {
+        if n >= 0 && n < N && m >= 0 && m < M && !samples.contains(where: { $0.0 == n && $0.1 == m }) {
+            samples.append((n, m))
+        }
+    }
+    addSample(0, 0)
+    addSample(0, min(31, M - 1))
+    addSample(0, min(32, M - 1))
+    addSample(min(63, N - 1), 0)
+    addSample(min(64, N - 1), min(32, M - 1))
+    addSample(N - 1, M - 1)
 
-let N = args.N, K = args.K, M = args.M
-let xCount = N * K
-let wCount = K * M
-let yCount = N * M
-
-var xHost = [Float16](repeating: 0, count: xCount)
-var wHost = [UInt8](repeating: 0, count: wCount)
-
-for i in 0..<xCount {
-    xHost[i] = Float16(Float((i % 97) - 48) * 0.02)
-}
-for i in 0..<wCount {
-    wHost[i] = floatToE4M3(Float((i % 53) - 26) * 0.05)
-}
-
-guard let xBuf = device.makeBuffer(bytes: &xHost, length: xCount * 2, options: .storageModeShared),
-      let wBuf = device.makeBuffer(bytes: &wHost, length: wCount, options: .storageModeShared),
-      let yBuf = device.makeBuffer(length: yCount * 4, options: .storageModeShared),
-      let queue = device.makeCommandQueue()
-else {
-    fputs("Buffer/queue alloc failed\n", stderr)
-    exit(1)
-}
-
-func encodeOnce(_ cb: MTLCommandBuffer) {
-    guard let enc = cb.makeComputeCommandEncoder() else { return }
-    enc.setComputePipelineState(pipeline)
-    enc.setBuffer(xBuf, offset: 0, index: 0)
-    enc.setBuffer(wBuf, offset: 0, index: 1)
-    enc.setBuffer(yBuf, offset: 0, index: 2)
-    var n32 = Int32(N), k32 = Int32(K), m32 = Int32(M)
-    enc.setBytes(&n32, length: 4, index: 3)
-    enc.setBytes(&k32, length: 4, index: 4)
-    enc.setBytes(&m32, length: 4, index: 5)
-    let tgM = 64, tgN = 32
     let grid = MTLSize(width: (M + tgN - 1) / tgN,
                        height: (N + tgM - 1) / tgM,
                        depth: 1)
-    let threads = MTLSize(width: 128, height: 1, depth: 1)
-    enc.dispatchThreadgroups(grid, threadsPerThreadgroup: threads)
-    enc.endEncoding()
+    let flops = 2.0 * Double(N) * Double(K) * Double(M)
+    var medians: [DType: Double] = [:]
+    var rows: [Row] = []
+
+    for dtype in args.dtypes {
+        guard let pipeline = pipelines[dtype] else {
+            fputs("missing pipeline \(dtype.rawValue)\n", stderr)
+            exit(1)
+        }
+        print("running \(shape.name) \(dtype.rawValue)")
+        fflush(stdout)
+        let threads = MTLSize(width: pipeline.threadExecutionWidth * 4, height: 1, depth: 1)
+        if (dtype == .f4f4 && !fp4OK) || ((dtype == .mxfp4 || dtype == .mx4x4) && !mxOK) {
+            fputs("\(dtype.rawValue) needs even X/W counts and K a multiple of 32\n", stderr)
+            exit(1)
+        }
+        let xArg: MTLBuffer
+        switch dtype {
+        case .i8i8: xArg = xInt8Buf
+        case .f8f8: xArg = xFp8Buf
+        case .f4f4, .mx4x4: xArg = xFp4Buf
+        case .fp16, .int8, .fp8, .mxfp4: xArg = xBuf
+        }
+        let wBuf = weightBuffer(dtype)
+        yBuf.contents().initializeMemory(as: UInt8.self, repeating: 0, count: yCount * MemoryLayout<Float>.size)
+
+        func runOnce() -> Double {
+            guard let cb = queue.makeCommandBuffer(),
+                  let enc = cb.makeComputeCommandEncoder() else {
+                fputs("command buffer alloc failed\n", stderr)
+                exit(1)
+            }
+            enc.setComputePipelineState(pipeline)
+            enc.setBuffer(xArg, offset: 0, index: 0)
+            enc.setBuffer(wBuf, offset: 0, index: 1)
+            enc.setBuffer(yBuf, offset: 0, index: 2)
+            var n32 = Int32(N), k32 = Int32(K), m32 = Int32(M)
+            enc.setBytes(&n32, length: 4, index: 3)
+            enc.setBytes(&k32, length: 4, index: 4)
+            enc.setBytes(&m32, length: 4, index: 5)
+            if dtype == .mxfp4 {
+                enc.setBuffer(wScaleBuf, offset: 0, index: 6)
+            } else if dtype == .mx4x4 {
+                enc.setBuffer(xScaleBuf, offset: 0, index: 6)
+                enc.setBuffer(wScaleBuf, offset: 0, index: 7)
+            }
+            enc.dispatchThreadgroups(grid, threadsPerThreadgroup: threads)
+            enc.endEncoding()
+            cb.commit()
+            cb.waitUntilCompleted()
+            if cb.status != .completed {
+                fputs("\(shape.name) \(dtype.rawValue) GPU error: \(cb.error?.localizedDescription ?? "\(cb.status)")\n", stderr)
+                exit(1)
+            }
+            let gpu = cb.gpuEndTime - cb.gpuStartTime
+            return gpu > 0 ? gpu : 0
+        }
+
+        for _ in 0..<args.warmup { _ = runOnce() }
+        var times = [Double]()
+        times.reserveCapacity(shape.iters)
+        for _ in 0..<shape.iters {
+            let dt = runOnce()
+            if dt <= 0 {
+                fputs("GPU timestamps unavailable\n", stderr)
+                exit(1)
+            }
+            times.append(dt)
+        }
+        times.sort()
+        let median = times[times.count / 2]
+        medians[dtype] = median
+
+        var maxRel: Float = 0
+        if dtype == .i8i8 {
+            let yPtr = yBuf.contents().bindMemory(to: Int32.self, capacity: yCount)
+            for (n, m) in samples {
+                var acc: Int32 = 0
+                let xBase = n * K
+                for k in 0..<K {
+                    acc += Int32(xInt8[xBase + k]) * Int32(wInt8[k * M + m])
+                }
+                let got = yPtr[n * M + m]
+                if got != acc {
+                    fputs(String(format: "%@ i8i8 mismatch Y[%d,%d] gpu=%d ref=%d\n",
+                                 shape.name, n, m, got, acc), stderr)
+                    exit(3)
+                }
+            }
+        } else {
+            let yPtr = yBuf.contents().bindMemory(to: Float.self, capacity: yCount)
+            for (n, m) in samples {
+                var acc: Float = 0
+                let xBase = n * K
+                for k in 0..<K {
+                    acc += refActivation(dtype, xBase + k) * refWeight(dtype, k, m)
+                }
+                let got = yPtr[n * M + m]
+                let absErr = abs(got - acc)
+                let rel = absErr / max(1e-6, abs(acc))
+                if rel > maxRel { maxRel = rel }
+                if rel > 1e-2 && absErr > 1e-3 {
+                    fputs(String(format: "%@ %@ mismatch Y[%d,%d] gpu=%.6g ref=%.6g abs=%.3g rel=%.3g\n",
+                                 shape.name, dtype.rawValue, n, m, got, acc, absErr, rel), stderr)
+                    exit(3)
+                }
+            }
+        }
+
+        let vs: String
+        if dtype == .fp16 {
+            vs = "1.000"
+        } else if let fp16 = medians[.fp16] {
+            vs = String(format: "%.3f", fp16 / median)
+        } else {
+            vs = "-"
+        }
+        rows.append(Row(shape: shape.name, N: N, K: K, M: M, dtype: dtype,
+                        medianMs: median * 1000, tflops: (flops / median) / 1e12,
+                        vsFp16: vs, refRel: maxRel))
+    }
+    return rows
 }
 
-for _ in 0..<args.warmup {
-    guard let cb = queue.makeCommandBuffer() else { continue }
-    encodeOnce(cb)
-    cb.commit()
-    cb.waitUntilCompleted()
+var rows: [Row] = []
+for shape in shapes {
+    rows.append(contentsOf: bench(shape))
 }
 
-var times = [Double]()
-times.reserveCapacity(args.iters)
-for _ in 0..<args.iters {
-    guard let cb = queue.makeCommandBuffer() else { continue }
-    encodeOnce(cb)
-    let t0 = CFAbsoluteTimeGetCurrent()
-    cb.commit()
-    cb.waitUntilCompleted()
-    times.append(CFAbsoluteTimeGetCurrent() - t0)
+func cell(_ text: String, _ width: Int, right: Bool) -> String {
+    let pad = max(0, width - text.count)
+    let spaces = String(repeating: " ", count: pad)
+    return right ? spaces + text : text + spaces
 }
 
-times.sort()
-let median = times[times.count / 2]
-let mean = times.reduce(0, +) / Double(times.count)
-let flops = 2.0 * Double(N) * Double(K) * Double(M)
+func tableLine(_ shape: String, _ n: String, _ k: String, _ m: String,
+               _ dtype: String, _ ms: String, _ tflops: String,
+               _ vs: String, _ rel: String) -> String {
+    [
+        cell(shape, 8, right: false),
+        cell(n, 6, right: true),
+        cell(k, 6, right: true),
+        cell(m, 6, right: true),
+        cell(dtype, 9, right: false),
+        cell(ms, 10, right: true),
+        cell(tflops, 8, right: true),
+        cell(vs, 8, right: true),
+        cell(rel, 10, right: true),
+    ].joined(separator: " ")
+}
 
-let yPtr = yBuf.contents().bindMemory(to: Float.self, capacity: yCount)
-var checksum: Float = 0
-let step = max(1, yCount / 4096)
-for i in stride(from: 0, to: yCount, by: step) { checksum += yPtr[i] }
-
-print(String(format: "median_ms: %.4f", median * 1000))
-print(String(format: "mean_ms:   %.4f", mean * 1000))
-print(String(format: "tflops_median: %.3f", (flops / median) / 1e12))
-print(String(format: "tflops_mean:   %.3f", (flops / mean) / 1e12))
-print(String(format: "checksum: %.6f", checksum))
+print("")
+let header = tableLine("shape", "N", "K", "M", "dtype", "median_ms", "tflops", "vs_fp16", "ref_rel")
+print(header)
+print(String(repeating: "-", count: header.count))
+for row in rows {
+    print(tableLine(
+        row.shape,
+        String(row.N),
+        String(row.K),
+        String(row.M),
+        row.dtype.rawValue,
+        String(format: "%.4f", row.medianMs),
+        String(format: "%.3f", row.tflops),
+        row.vsFp16,
+        String(format: "%.3g", row.refRel)))
+}
 print("ok")
+fflush(stdout)

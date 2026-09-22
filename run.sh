@@ -14,4 +14,4 @@ xcrun -sdk macosx metallib "$out/fp8_mlp.air" -o "$out/default.metallib"
 echo "== compile host =="
 swiftc -O -framework Metal -framework Foundation main.swift -o "$out/fp8_mlp_bench"
 echo "== run =="
-(cd "$out" && cp "$ROOT/fp8_mlp.metal" . && ./fp8_mlp_bench "$@")
+FP8_MLP_METALLIB="$out/default.metallib" "$out/fp8_mlp_bench" "$@"
