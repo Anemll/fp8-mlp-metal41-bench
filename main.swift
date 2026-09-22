@@ -91,6 +91,8 @@ enum DType: String, CaseIterable {
     case f4f4
     case mxfp4
     case mx4x4 = "mxfp4/a4"
+    case mx8x4 = "mxfp4/a8"
+    case f8x4 = "mxfp4/f8"
 
     var kernel: String {
         switch self {
@@ -102,6 +104,8 @@ enum DType: String, CaseIterable {
         case .f4f4: return "f4f4_mlp_gemm"
         case .mxfp4: return "mxfp4_mlp_gemm"
         case .mx4x4: return "mx4x4_mlp_gemm"
+        case .mx8x4: return "mx8x4_mlp_gemm"
+        case .f8x4: return "f8x4_mlp_gemm"
         }
     }
 }
@@ -123,6 +127,30 @@ struct Args {
     var dtypes: [DType] = Array(DType.allCases)
     var suite = false
     var shapeSet = false
+    var tile: Tile? = nil
+    var autotune = false
+    var useProfile = true
+}
+
+// Output tile per threadgroup: BM rows of Y (N direction) x BN cols (M direction), 4 simdgroups.
+struct Tile: Hashable {
+    var bm: Int
+    var bn: Int
+    var name: String { "\(bm)x\(bn)" }
+}
+
+let tiles = [Tile(bm: 128, bn: 64), Tile(bm: 64, bn: 128), Tile(bm: 128, bn: 128), Tile(bm: 64, bn: 64), Tile(bm: 64, bn: 32), Tile(bm: 32, bn: 64),
+             Tile(bm: 16, bn: 64), Tile(bm: 16, bn: 32), Tile(bm: 8, bn: 64), Tile(bm: 8, bn: 32)]
+
+// Best measured tile per dtype on M5 Max (tune/README.md). The Apple sample tile (64x32)
+// reaches only half the NAX peak there. N <= 16 (decode) only fills the first rows of a
+// tile, so it takes a 16-row tile with more columns in flight.
+func defaultTile(_ dtype: DType, _ N: Int) -> Tile {
+    if N <= 16 { return Tile(bm: 16, bn: 32) }
+    switch dtype {
+    case .fp16, .i8i8: return Tile(bm: 128, bn: 64)
+    case .int8, .fp8, .f8f8, .f4f4, .mxfp4, .mx4x4, .mx8x4, .f8x4: return Tile(bm: 64, bn: 64)
+    }
 }
 
 let suiteShapes = [
@@ -137,13 +165,25 @@ func parseArgs() -> Args {
     var i = 1
     while i < argv.count {
         let key = argv[i]
-        if key == "--suite" {
-            a.suite = true
+        if key == "--suite" || key == "--autotune" || key == "--no-profile" {
+            if key == "--suite" { a.suite = true }
+            if key == "--autotune" { a.autotune = true }
+            if key == "--no-profile" { a.useProfile = false }
             i += 1
             continue
         }
         i += 1
         guard i < argv.count else { break }
+        if key == "--tile" {
+            let name = argv[i]
+            i += 1
+            guard let t = tiles.first(where: { $0.name == name }) else {
+                fputs("Unknown --tile \(name) (\(tiles.map(\.name).joined(separator: ", ")))\n", stderr)
+                exit(1)
+            }
+            a.tile = t
+            continue
+        }
         if key == "--dtype" {
             let name = argv[i]
             i += 1
@@ -152,7 +192,7 @@ func parseArgs() -> Args {
             } else if let dtype = DType(rawValue: name) {
                 a.dtypes = [dtype]
             } else {
-                fputs("Unknown --dtype \(name) (fp16, int8, i8i8, fp8, f8f8, f4f4, mxfp4, mxfp4/a4, all)\n", stderr)
+                fputs("Unknown --dtype \(name) (fp16, int8, i8i8, fp8, f8f8, f4f4, mxfp4, mxfp4/a4, mxfp4/a8, mxfp4/f8, all)\n", stderr)
                 exit(1)
             }
             continue
@@ -222,6 +262,7 @@ struct Row {
     var K: Int
     var M: Int
     var dtype: DType
+    var tile: Tile
     var medianMs: Double
     var tflops: Double
     var vsFp16: String
@@ -255,12 +296,65 @@ guard let queue = device.makeCommandQueue() else {
     exit(1)
 }
 
-var pipelines: [DType: MTLComputePipelineState] = [:]
-for dtype in args.dtypes {
-    pipelines[dtype] = makePipeline(library: library, device: device, name: dtype.kernel)
+struct PipelineKey: Hashable {
+    var dtype: DType
+    var tile: Tile
+}
+var pipelines: [PipelineKey: MTLComputePipelineState] = [:]
+func pipeline(_ dtype: DType, _ tile: Tile) -> MTLComputePipelineState {
+    let key = PipelineKey(dtype: dtype, tile: tile)
+    if let p = pipelines[key] { return p }
+    let p = makePipeline(library: library, device: device, name: "\(dtype.kernel)_\(tile.name)")
+    pipelines[key] = p
+    return p
 }
 
-let tgM = 64, tgN = 32
+// Per-device tile profile, written by --autotune and read by later runs.
+// Keyed by device name and GPU architecture so M5, M5 Max, M6 each keep their own file.
+struct Profile: Codable {
+    var device: String
+    var architecture: String
+    var tiles: [String: String]  // "<dtype> N=.. K=.. M=.." -> "BMxBN"
+}
+
+let architecture = device.architecture.name
+let profileURL: URL = {
+    let slug = "\(device.name)_\(architecture)".lowercased()
+        .map { $0.isLetter || $0.isNumber ? String($0) : "-" }.joined()
+    return URL(fileURLWithPath: FileManager.default.currentDirectoryPath)
+        .appendingPathComponent("profiles").appendingPathComponent("\(slug).json")
+}()
+var profile: Profile = {
+    if args.useProfile, let data = try? Data(contentsOf: profileURL),
+       let p = try? JSONDecoder().decode(Profile.self, from: data) {
+        return p
+    }
+    return Profile(device: device.name, architecture: architecture, tiles: [:])
+}()
+let profileLoaded = !profile.tiles.isEmpty
+print("architecture: \(architecture)")
+if args.autotune {
+    print("tiles: autotune (writes \(profileURL.path))")
+} else if args.tile != nil {
+    print("tiles: --tile \(args.tile!.name)")
+} else if profileLoaded {
+    print("tiles: profile \(profileURL.path)")
+} else {
+    print("tiles: built-in defaults (run --autotune to fit this device)")
+}
+
+func profileKey(_ dtype: DType, _ N: Int, _ K: Int, _ M: Int) -> String {
+    "\(dtype.rawValue) N=\(N) K=\(K) M=\(M)"
+}
+
+func chosenTile(_ dtype: DType, _ N: Int, _ K: Int, _ M: Int) -> Tile {
+    if let t = args.tile { return t }
+    if args.useProfile, let name = profile.tiles[profileKey(dtype, N, K, M)],
+       let t = tiles.first(where: { $0.name == name }) {
+        return t
+    }
+    return defaultTile(dtype, N)
+}
 
 func bench(_ shape: ShapeCase) -> [Row] {
     let N = shape.N, K = shape.K, M = shape.M
@@ -319,7 +413,7 @@ func bench(_ shape: ShapeCase) -> [Row] {
         case .fp8: return wFp8Buf
         case .f8f8: return wFp8Buf
         case .f4f4: return wFp4Buf
-        case .mxfp4, .mx4x4: return wMxBuf
+        case .mxfp4, .mx4x4, .mx8x4, .f8x4: return wMxBuf
         }
     }
     func refActivation(_ dtype: DType, _ i: Int) -> Float {
@@ -334,6 +428,10 @@ func bench(_ shape: ShapeCase) -> [Row] {
             let n = i / K
             let k = i % K
             return e2m1At(xFp4, i) * ue8m0ToFloat(xScale[n * block + k / 32])
+        case .mx8x4:
+            let block = K / 32
+            return e4m3ToFloat(xFp8[i]) * ue8m0ToFloat(xScale[(i / K) * block + (i % K) / 32])
+        case .f8x4: return e4m3ToFloat(xFp8[i])
         }
     }
     func refWeight(_ dtype: DType, _ k: Int, _ m: Int) -> Float {
@@ -344,55 +442,53 @@ func bench(_ shape: ShapeCase) -> [Row] {
         case .i8i8: return Float(wInt8[i])
         case .fp8, .f8f8: return e4m3ToFloat(wFp8[i])
         case .f4f4: return e2m1At(wFp4, i)
-        case .mxfp4, .mx4x4:
+        case .mxfp4, .mx4x4, .mx8x4, .f8x4:
             let block = K / 32
             return e2m1At(wMx, m * K + k) * ue8m0ToFloat(wScale[m * block + k / 32])
         }
     }
 
-    var samples = [(Int, Int)]()
-    func addSample(_ n: Int, _ m: Int) {
-        if n >= 0 && n < N && m >= 0 && m < M && !samples.contains(where: { $0.0 == n && $0.1 == m }) {
-            samples.append((n, m))
+    // Tile corners and the far edge of the matrix.
+    func samples(_ tile: Tile) -> [(Int, Int)] {
+        var out = [(Int, Int)]()
+        func add(_ n: Int, _ m: Int) {
+            if n >= 0 && n < N && m >= 0 && m < M && !out.contains(where: { $0.0 == n && $0.1 == m }) {
+                out.append((n, m))
+            }
         }
+        add(0, 0)
+        add(0, min(tile.bn - 1, M - 1))
+        add(0, min(tile.bn, M - 1))
+        add(min(tile.bm - 1, N - 1), 0)
+        add(min(tile.bm, N - 1), min(tile.bn, M - 1))
+        add(N - 1, M - 1)
+        return out
     }
-    addSample(0, 0)
-    addSample(0, min(31, M - 1))
-    addSample(0, min(32, M - 1))
-    addSample(min(63, N - 1), 0)
-    addSample(min(64, N - 1), min(32, M - 1))
-    addSample(N - 1, M - 1)
 
-    let grid = MTLSize(width: (M + tgN - 1) / tgN,
-                       height: (N + tgM - 1) / tgM,
-                       depth: 1)
     let flops = 2.0 * Double(N) * Double(K) * Double(M)
     var medians: [DType: Double] = [:]
     var rows: [Row] = []
 
     for dtype in args.dtypes {
-        guard let pipeline = pipelines[dtype] else {
-            fputs("missing pipeline \(dtype.rawValue)\n", stderr)
-            exit(1)
-        }
-        print("running \(shape.name) \(dtype.rawValue)")
-        fflush(stdout)
-        let threads = MTLSize(width: pipeline.threadExecutionWidth * 4, height: 1, depth: 1)
-        if (dtype == .f4f4 && !fp4OK) || ((dtype == .mxfp4 || dtype == .mx4x4) && !mxOK) {
-            fputs("\(dtype.rawValue) needs even X/W counts and K a multiple of 32\n", stderr)
+        if (dtype == .f4f4 && !fp4OK) || ([.mxfp4, .mx4x4].contains(dtype) && !mxOK) || ([.mx8x4, .f8x4].contains(dtype) && (!mxOK || K % 128 != 0)) {
+            fputs("\(dtype.rawValue) needs even X/W counts and K a multiple of 32 (128 for FP8 × MXFP4)\n", stderr)
             exit(1)
         }
         let xArg: MTLBuffer
         switch dtype {
         case .i8i8: xArg = xInt8Buf
-        case .f8f8: xArg = xFp8Buf
+        case .f8f8, .mx8x4, .f8x4: xArg = xFp8Buf
         case .f4f4, .mx4x4: xArg = xFp4Buf
         case .fp16, .int8, .fp8, .mxfp4: xArg = xBuf
         }
         let wBuf = weightBuffer(dtype)
-        yBuf.contents().initializeMemory(as: UInt8.self, repeating: 0, count: yCount * MemoryLayout<Float>.size)
 
-        func runOnce() -> Double {
+        func runOnce(_ tile: Tile) -> Double {
+            let pipeline = pipeline(dtype, tile)
+            let grid = MTLSize(width: (M + tile.bn - 1) / tile.bn,
+                               height: (N + tile.bm - 1) / tile.bm,
+                               depth: 1)
+            let threads = MTLSize(width: pipeline.threadExecutionWidth * 4, height: 1, depth: 1)
             guard let cb = queue.makeCommandBuffer(),
                   let enc = cb.makeComputeCommandEncoder() else {
                 fputs("command buffer alloc failed\n", stderr)
@@ -406,9 +502,9 @@ func bench(_ shape: ShapeCase) -> [Row] {
             enc.setBytes(&n32, length: 4, index: 3)
             enc.setBytes(&k32, length: 4, index: 4)
             enc.setBytes(&m32, length: 4, index: 5)
-            if dtype == .mxfp4 {
+            if dtype == .mxfp4 || dtype == .f8x4 {
                 enc.setBuffer(wScaleBuf, offset: 0, index: 6)
-            } else if dtype == .mx4x4 {
+            } else if dtype == .mx4x4 || dtype == .mx8x4 {
                 enc.setBuffer(xScaleBuf, offset: 0, index: 6)
                 enc.setBuffer(wScaleBuf, offset: 0, index: 7)
             }
@@ -424,11 +520,33 @@ func bench(_ shape: ShapeCase) -> [Row] {
             return gpu > 0 ? gpu : 0
         }
 
-        for _ in 0..<args.warmup { _ = runOnce() }
+        var tile = chosenTile(dtype, N, K, M)
+        if args.autotune {
+            // Short median per tile; the full timing below reruns the winner.
+            let tuneIters = max(5, min(20, shape.iters / 5))
+            var results: [(Tile, Double)] = []
+            for candidate in tiles {
+                for _ in 0..<2 { _ = runOnce(candidate) }
+                var t = (0..<tuneIters).map { _ in runOnce(candidate) }
+                t.sort()
+                results.append((candidate, t[t.count / 2]))
+            }
+            results.sort { $0.1 < $1.1 }
+            tile = results[0].0
+            profile.tiles[profileKey(dtype, N, K, M)] = tile.name
+            let top = results.prefix(4).map { String(format: "%@ %.4f", $0.0.name, $0.1 * 1000) }
+            print("autotune \(shape.name) \(dtype.rawValue): \(top.joined(separator: " | ")) ms")
+        }
+        let samples = samples(tile)
+        print("running \(shape.name) \(dtype.rawValue) tile \(tile.name)")
+        fflush(stdout)
+        yBuf.contents().initializeMemory(as: UInt8.self, repeating: 0, count: yCount * MemoryLayout<Float>.size)
+
+        for _ in 0..<args.warmup { _ = runOnce(tile) }
         var times = [Double]()
         times.reserveCapacity(shape.iters)
         for _ in 0..<shape.iters {
-            let dt = runOnce()
+            let dt = runOnce(tile)
             if dt <= 0 {
                 fputs("GPU timestamps unavailable\n", stderr)
                 exit(1)
@@ -483,7 +601,7 @@ func bench(_ shape: ShapeCase) -> [Row] {
         } else {
             vs = "-"
         }
-        rows.append(Row(shape: shape.name, N: N, K: K, M: M, dtype: dtype,
+        rows.append(Row(shape: shape.name, N: N, K: K, M: M, dtype: dtype, tile: tile,
                         medianMs: median * 1000, tflops: (flops / median) / 1e12,
                         vsFp16: vs, refRel: maxRel))
     }
@@ -502,7 +620,7 @@ func cell(_ text: String, _ width: Int, right: Bool) -> String {
 }
 
 func tableLine(_ shape: String, _ n: String, _ k: String, _ m: String,
-               _ dtype: String, _ ms: String, _ tflops: String,
+               _ dtype: String, _ tile: String, _ ms: String, _ tflops: String,
                _ vs: String, _ rel: String) -> String {
     [
         cell(shape, 8, right: false),
@@ -510,6 +628,7 @@ func tableLine(_ shape: String, _ n: String, _ k: String, _ m: String,
         cell(k, 6, right: true),
         cell(m, 6, right: true),
         cell(dtype, 9, right: false),
+        cell(tile, 6, right: false),
         cell(ms, 10, right: true),
         cell(tflops, 8, right: true),
         cell(vs, 8, right: true),
@@ -517,8 +636,21 @@ func tableLine(_ shape: String, _ n: String, _ k: String, _ m: String,
     ].joined(separator: " ")
 }
 
+if args.autotune {
+    do {
+        try FileManager.default.createDirectory(at: profileURL.deletingLastPathComponent(),
+                                                withIntermediateDirectories: true)
+        let enc = JSONEncoder()
+        enc.outputFormatting = [.prettyPrinted, .sortedKeys]
+        try enc.encode(profile).write(to: profileURL)
+        print("wrote profile: \(profileURL.path)")
+    } catch {
+        fputs("could not write profile \(profileURL.path): \(error)\n", stderr)
+    }
+}
+
 print("")
-let header = tableLine("shape", "N", "K", "M", "dtype", "median_ms", "tflops", "vs_fp16", "ref_rel")
+let header = tableLine("shape", "N", "K", "M", "dtype", "tile", "median_ms", "tflops", "vs_fp16", "ref_rel")
 print(header)
 print(String(repeating: "-", count: header.count))
 for row in rows {
@@ -528,6 +660,7 @@ for row in rows {
         String(row.K),
         String(row.M),
         row.dtype.rawValue,
+        row.tile.name,
         String(format: "%.4f", row.medianMs),
         String(format: "%.3f", row.tflops),
         row.vsFp16,
