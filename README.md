@@ -32,6 +32,7 @@ MPP in Metal 4.1 has no FP8 × FP4 `matmul2d`: a scaled or plain FP8 left operan
 - **Low precision wins where memory is the limit.** On the N=1 row, the 8-bit and native 4-bit paths are 2.6–3.0× faster than FP16.
 - **NAX + ALU does not stack.** Running `simdgroup_matrix` FMAs next to `matmul2d` adds at most about 5%, and more ALU work slows the Neural Accelerator. See [`tune/README.md`](tune/README.md).
 - **Best tiles differ by chip, dtype and shape**, so tune each machine with `--autotune` (below) rather than reusing another chip's tiles.
+- **Core AI confirms the FP16 peak but not INT8×INT8.** The same GEMM through Core AI ([`coreai/`](coreai/README.md)) reaches 65 TFLOPs on the GPU for FP16 and for FP8 or INT8 weights. W8A8 (`i8i8`, `f8f8`) reaches only 42–48, because Core AI does not produce a native INT8×INT8 matmul. The ANE runs FP16 at about 10 TFLOPs and INT8 weights with FP16 activations at about 18. With the ANE preferred, no FP8 or INT8×INT8 `nn.Linear` GEMM was placed on the ANE. They compiled to the GPU instead.
 
 ## Requirements
 

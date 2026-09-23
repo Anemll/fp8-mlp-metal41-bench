@@ -1,0 +1,17 @@
+[project]
+name = "coreai-gemm-bench"
+version = "0.1.0"
+description = "Core AI GEMM TFLOPs check (fp16/fp8/int8, GPU + ANE) next to the Metal 4.1 bench"
+requires-python = ">=3.12"
+dependencies = [
+    "coreai-opt>=0.2.1",
+    "coreai-torch>=0.4.2",
+]
+
+[dependency-groups]
+dev = ["pytest>=8"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+pythonpath = ["."]
+markers = ["device: runs Core AI export + inference on this Mac (slow)"]

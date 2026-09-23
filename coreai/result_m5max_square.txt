@@ -1,0 +1,42 @@
+# ./run.sh --shapes square --stack 8 --iters 10  (Mac17,6 M5 Max, macOS 27, 2026-09-22)
+device: Apple M5 Max
+coreai_opt=0.2.1 coreai_torch=0.4.2
+timing: wall-clock median around InferenceFunction; tflops from T(S)-T(1) slope
+  fp16  FP16 weights and activations
+  fp8   W8A16: FP8 E4M3 weights (per-tensor), FP16 activations
+  f8f8  W8A8: FP8 E4M3 weights and activations (per-tensor)
+  int8  W8A16: INT8 weights (per-channel), FP16 activations
+  i8i8  W8A8: INT8 weights (per-channel) and activations (per-tensor)
+running square fp16 gpu
+  square   4096  4096  4096 fp16  gpu     GPU       8    2.947    17.690    2.106   65.25   46.64  4.7e-04 OK     w=fp16 a=fp16
+running square fp8 gpu
+  square   4096  4096  4096 fp8   gpu     GPU       8    3.029    18.837    2.258   60.86   45.38  2.6e-02 OK     w=fp8 a=fp16
+running square f8f8 gpu
+  square   4096  4096  4096 f8f8  gpu     GPU       8    4.368    27.311    3.278   41.93   31.47  5.5e-02 OK     w=fp8 a=fp8
+running square int8 gpu
+  square   4096  4096  4096 int8  gpu     GPU       8    2.864    17.731    2.124   64.71   47.99  9.1e-03 OK     w=int8 a=fp16
+running square i8i8 gpu
+  square   4096  4096  4096 i8i8  gpu     GPU       8    3.725    24.467    2.963   46.38   36.89  1.7e-02 OK     w=int8 a=int8
+running square fp16 ane
+  square   4096  4096  4096 fp16  ane     ANE       8   15.015   109.499   13.498   10.18    9.15  5.3e-04 OK     w=fp16 a=fp16
+running square fp8 ane
+  square   4096  4096  4096 fp8   ane     GPU       8    3.046    18.825    2.254   60.97   45.12  2.6e-02 OK     w=fp8 a=fp16  # ANE requested, not placed on ANE
+running square f8f8 ane
+  square   4096  4096  4096 f8f8  ane     GPU       8    4.303    27.116    3.259   42.17   31.94  5.5e-02 OK     w=fp8 a=fp8  # ANE requested, not placed on ANE
+running square int8 ane
+  square   4096  4096  4096 int8  ane     ANE       8   12.883    65.400    7.502   18.32   10.67  9.1e-03 OK     w=int8 a=fp16
+running square i8i8 ane
+  square   4096  4096  4096 i8i8  ane     GPU       8    4.159    24.171    2.859   48.08   33.05  1.7e-02 OK     w=int8 a=int8  # ANE requested, not placed on ANE
+
+shape       N     K     M dtype compute placed    S    t1_ms     tS_ms  gemm_ms  tflops   t1_tf  rel_err status matmul
+----------------------------------------------------------------------------------------------------------------------
+square   4096  4096  4096 fp16  gpu     GPU       8    2.947    17.690    2.106   65.25   46.64  4.7e-04 OK     w=fp16 a=fp16
+square   4096  4096  4096 fp8   gpu     GPU       8    3.029    18.837    2.258   60.86   45.38  2.6e-02 OK     w=fp8 a=fp16
+square   4096  4096  4096 f8f8  gpu     GPU       8    4.368    27.311    3.278   41.93   31.47  5.5e-02 OK     w=fp8 a=fp8
+square   4096  4096  4096 int8  gpu     GPU       8    2.864    17.731    2.124   64.71   47.99  9.1e-03 OK     w=int8 a=fp16
+square   4096  4096  4096 i8i8  gpu     GPU       8    3.725    24.467    2.963   46.38   36.89  1.7e-02 OK     w=int8 a=int8
+square   4096  4096  4096 fp16  ane     ANE       8   15.015   109.499   13.498   10.18    9.15  5.3e-04 OK     w=fp16 a=fp16
+square   4096  4096  4096 fp8   ane     GPU       8    3.046    18.825    2.254   60.97   45.12  2.6e-02 OK     w=fp8 a=fp16  # ANE requested, not placed on ANE
+square   4096  4096  4096 f8f8  ane     GPU       8    4.303    27.116    3.259   42.17   31.94  5.5e-02 OK     w=fp8 a=fp8  # ANE requested, not placed on ANE
+square   4096  4096  4096 int8  ane     ANE       8   12.883    65.400    7.502   18.32   10.67  9.1e-03 OK     w=int8 a=fp16
+square   4096  4096  4096 i8i8  ane     GPU       8    4.159    24.171    2.859   48.08   33.05  1.7e-02 OK     w=int8 a=int8  # ANE requested, not placed on ANE
