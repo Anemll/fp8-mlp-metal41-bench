@@ -2,3 +2,5 @@
 __pycache__/
 .pytest_cache/
 artifacts/
+artifacts_stacked/
+acc_probe_*.npy

@@ -97,3 +97,29 @@ The ANE `int8` number (18.3) is INT8 weights with FP16 activations, not INT8×IN
 - **The handoff's "ANE FP8 ≈ 42 TFLOPs" was GPU.** Those `.aimodelc` packages had no ANE region.
 
 Caveats: timings are host wall-clock (median of 10 after 3 warmup), not GPU timestamps. The slope assumes the S GEMMs in one call run back-to-back with no extra per-layer cost. For `f8f8` and `i8i8`, the per-layer activation quantize/dequantize is counted in `T_gemm`, since it is part of the real layer cost. This is a laptop, so rerun a single row if it looks low.
+
+## ANE FP8 conv-chain: 72 TFLOPs on M6 (reproduce)
+
+`bench_stacked.py` packs `S` sequential bias-free `nn.Linear(ch, ch)` layers into one `.aimodel`. A 1×1 conv over `N = sp·sp` activations is identical to `nn.Linear(ch, ch)`, so `--shapes conv512` is `N=4096, K=512, M=512` (`sp=64`). `f8f8` is FP8 E4M3FN weights **and** activations (symmetric per-tensor) → IR `dequant → fp16 broadcasting_batch_matmul`: FP8 is the 1-byte **storage** format and the MAC runs FP16, the same activation-bandwidth trick as the INT8 W8A8 gist.
+
+Confirmed on **Apple M6** (Mac18,5), ANE preferred:
+
+| config | dtype | ms | TFLOPS |
+| --- | --- | ---: | ---: |
+| conv512, 256×512 (256 layers) | f8f8 | **7.5988** | **72.35** |
+| conv512, 128×512 (128 layers) | f8f8 | 5.3845 | 51.05 |
+| conv512, 128×512 (128 layers) | fp16 | 7.5406 | 36.45 |
+
+`TFLOPS = 2·N·K·M·S / wall_clock`; `256×512` = **256 layers × 512 channels**. FP8 is **1.87×** FP16 at 128 layers.
+
+Reproduce:
+
+```bash
+cd coreai
+unset USE_LOCAL_COREAI
+uv run python bench_stacked.py --compute ane --dtypes f8f8 --shapes conv512 --stacks 256
+```
+
+`--compute ane` is preference-only, but placement is real on M6: the same `conv512` S=256 `f8f8` config with `--compute gpu` ran **27.47 ms / 20.02 TFLOPS**, so the ANE row is **3.60×** faster. Results are written to `results_stacked_ane.txt` and `results.md`; assets are cached in `artifacts_stacked/`.
+
+Note: this is a chip difference from the M5 Max section above, where `f8f8` did **not** specialize on the ANE and fell back to the GPU. On M6 the FP8 chain lands on the ANE.
