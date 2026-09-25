@@ -5,3 +5,4 @@ artifacts/
 artifacts_stacked/
 acc_probe_*.npy
 artifacts_sparsity/
+artifacts_winograd/

@@ -202,3 +202,42 @@ cd coreai
 ```
 
 Models are cached in `artifacts_sparsity/`; pass `--force` to rebuild them.
+
+## ANE Winograd: does a 3×3 conv get fewer multiplies?
+
+![ANE speedups: Winograd vs sparsity, from Apple patents US20260073008A1 (Winograd) and US11120327B2 / US20260057227A1 (sparsity)](assets/ane-winograd-vs-sparsity-infographic.png)
+
+Winograd and sparsity are separate speedups. Winograd rewrites an eligible dense conv at compile time so it needs fewer multiplies (F(2×2, 3×3) needs 4 instead of 9). Sparsity skips zeros at runtime. The patent descriptions are not a claim about shipping silicon. A 1×1 conv, like the chains above, has nothing for Winograd to save.
+
+Core AI has no public Winograd switch. The ANE compiler has an internal `DisableWinograd` option that Core AI doesn't expose, so `bench_winograd.py` compares shapes instead:
+
+| variant | conv | Winograd-eligible |
+|---|---|---|
+| `k1` | 1×1 | nothing to save (reference multiply rate) |
+| `k3` | 3×3, stride 1, dilation 1, padding 1 | yes |
+| `k3d2` | 3×3, stride 1, dilation 2, padding 2 | no: same work, but Winograd requires dilation 1 |
+
+Setup: 512 channels, 64×64, dense random activations (signed), weights scaled to keep unit variance, 256 layers for `k1` and 64 for 3×3. FP8 TFLOPS counts the direct-conv work (`2·H·W·C·C·k·k·S / wall_clock`), so a Winograd path would show as `k3` beating `k1`.
+
+Apple M6, ANE preferred, f8f8, median of 50:
+
+| variant | kernel | GFLOP | ms | FP8 TFLOPS |
+|---|---|---:|---:|---:|
+| `k1` | 1×1 | 549.8 | 9.59 | 57.3 |
+| `k3` | 3×3 | 1237.0 | 20.14 | **61.4** |
+| `k3d2` | 3×3, dilation 2 | 1237.0 | 25.88 | 47.8 |
+
+- **FP8 3×3 gets no Winograd-sized gain.** It runs 1.07× the 1×1 rate (a rerun gave 60.8); F(2×2, 3×3) could give up to 2.25×. The small gain fits normal data reuse in a 3×3 kernel.
+- **FP16 behaves differently:** with `--dtype fp16`, 3×3 runs 1.40× the 1×1 rate (46.6 vs 33.2 TF). The ANE compiler strings show 1D Winograd (`winograd1_d_en`) and an error for "2D Winograd but target HAL does not support it". 1D F(2,3) cuts multiplies by 1.5×, which fits. FP8 has less to gain, since its 1×1 already runs about 1.8× FP16, and Winograd transforms may be kept away from FP8 for precision reasons.
+- **The dilated control runs below 1×1** because dilation adds its own cost. Compare `k3` with `k1`.
+- **The IR can't confirm it.** Core AI's compiler IR dump (`COREAI_COMPILER_DEBUG_MODE=print-ir-after-all`) stops at `compile-for-delegates`; the ANE compiler's choice isn't visible there.
+
+Reproduce:
+
+```bash
+cd coreai
+./bench_winograd.sh                       # k1 k3 k3d2, f8f8 (~2 min cold, models cached after)
+./bench_winograd.sh k3 k3d2 --stack 32    # pick variants and depth
+```
+
+Models are cached in `artifacts_winograd/`; pass `--force` to rebuild them.
