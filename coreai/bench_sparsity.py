@@ -11,6 +11,7 @@ Modes (MODE:P, P = zero fraction):
   zero:0   — plain conv, all-zero input (every activation is 0)
   act:P    — conv + bias + ReLU per layer; bias calibrated per layer so exactly
              a fraction P of activations are zero, rescaled to unit RMS
+  act:P:Q  — act:P combined with a fraction Q of weights zeroed (random positions)
   w:P      — plain conv, fraction P of weights zeroed at random positions
   w24:P    — plain conv, P of every 4 consecutive input-channel weights zeroed
 
@@ -18,6 +19,7 @@ TFLOPS is dense-equivalent: 2*N*C*C*S / wall_clock, zeros counted as work.
 
 Usage:
   uv run python bench_sparsity.py plain:0 zero:0 act:0.5 act:0.75 w:0.5
+  uv run python bench_sparsity.py act:0.75:0.75
   uv run python bench_sparsity.py --dtype fp16 plain:0
 Do NOT set USE_LOCAL_COREAI.
 """
@@ -103,11 +105,13 @@ def zero_weights(model: ConvChain, p: float, structured: bool) -> None:
         w.mul_((1 - p) ** -0.5)  # keep gain ~1
 
 
-def build(mode: str, p: float, stack: int) -> nn.Module:
+def build(mode: str, p: float, stack: int, q: float = 0.0) -> nn.Module:
     torch.manual_seed(SEED)
     model = ConvChain(stack, relu=(mode == "act")).eval()
     with torch.no_grad():
         if mode == "act":
+            if q > 0:
+                zero_weights(model, q, structured=False)
             zf = calibrate_act_sparsity(model, p)
             print(f"  calibrated zero fraction: first={zf[0]:.3f} "
                   f"last={zf[-1]:.3f} mean={np.mean(zf):.3f}")
@@ -116,11 +120,12 @@ def build(mode: str, p: float, stack: int) -> nn.Module:
     return model
 
 
-def export(mode: str, p: float, stack: int, dtype: str, force: bool) -> Path:
-    out = ARTIFACTS / f"{dtype}_{mode}{p:g}_S{stack}.aimodel"
+def export(mode: str, p: float, stack: int, dtype: str, force: bool, q: float = 0.0) -> Path:
+    wtag = f"_w{q:g}" if q > 0 else ""
+    out = ARTIFACTS / f"{dtype}_{mode}{p:g}{wtag}_S{stack}.aimodel"
     if out.exists() and not force:
         return out
-    model = build(mode, p, stack)
+    model = build(mode, p, stack, q)
     example = torch.randn(*SHAPE)
     if dtype == "fp16":
         model, example = model.to(torch.float16), example.to(torch.float16)
@@ -181,25 +186,28 @@ def main() -> int:
     flops = 2 * H * W * C * C * args.stack
     rows = []
     for spec in args.specs:
-        mode, p = spec.split(":")
+        mode, p, *rest = spec.split(":")
         p = float(p)
+        q = float(rest[0]) if rest else 0.0
         if mode not in ("plain", "zero", "act", "w", "w24"):
             raise SystemExit(f"unknown mode {mode!r}")
-        print(f"== {args.dtype} {mode} p={p:g} S={args.stack}", flush=True)
+        if q > 0 and mode != "act":
+            raise SystemExit(f"weight fraction :Q only combines with act, got {spec!r}")
+        print(f"== {args.dtype} {spec} S={args.stack}", flush=True)
         build_mode = "plain" if mode == "zero" else mode
-        path = export(build_mode, p, args.stack, args.dtype, args.force)
+        path = export(build_mode, p, args.stack, args.dtype, args.force, q)
         torch.manual_seed(SEED)
         x = torch.randn(*SHAPE).to(torch.float16).numpy()
         if mode == "zero":
             x = np.zeros_like(x)
         med, out_zero = asyncio.run(time_inference(path, x, args.compute))
-        rows.append((mode, p, med, out_zero))
+        rows.append((spec, med, out_zero))
         print(f"  {med * 1e3:.3f} ms  {flops / med / 1e12:.2f} TFLOPS  "
               f"output zero fraction {out_zero:.3f}", flush=True)
 
-    print(f"\n{'dtype':5s} {'mode':5s} {'zero%':>6s} {'ms':>8s} {'TFLOPS':>7s} {'out0%':>6s}")
-    for mode, p, med, out_zero in rows:
-        print(f"{args.dtype:5s} {mode:5s} {p * 100:6.0f} {med * 1e3:8.3f} "
+    print(f"\n{'dtype':5s} {'spec':14s} {'ms':>8s} {'TFLOPS':>7s} {'out0%':>6s}")
+    for spec, med, out_zero in rows:
+        print(f"{args.dtype:5s} {spec:14s} {med * 1e3:8.3f} "
               f"{flops / med / 1e12:7.2f} {out_zero * 100:6.1f}")
     return 0
 

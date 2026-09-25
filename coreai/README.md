@@ -146,48 +146,58 @@ The mechanisms above come from patent descriptions, not a confirmed description 
 
 | mode | what is zero |
 |---|---|
-| `plain:0` | nothing: dense random activations |
+| `plain:0` | nothing: dense random activations (signed) |
 | `zero:0` | the input, so every activation is 0 |
-| `act:P` | fraction `P` of activations at **every** layer (conv + bias + ReLU, bias calibrated per layer, rescaled to unit RMS) |
+| `act:P` | fraction `P` of activations at **every** layer (conv + bias + ReLU, bias calibrated per layer, rescaled to unit RMS). `act:0` has no zeros, but every value is positive |
 | `w:P` | fraction `P` of weights, random positions |
 | `w24:P` | `P` of every 4 consecutive input-channel weights (structured) |
+| `act:P:Q` | joint: `act:P` plus fraction `Q` of weights zero, random positions |
 
 TFLOPS is dense-equivalent: `2·N·C·C·S / wall_clock`, with zeros counted as work.
 
-Apple M6, ANE preferred, conv512, 256 layers, median of 50:
+Apple M6, ANE preferred, f8f8, conv512, 256 layers, median of 50. All rows come from one pass (`./bench_sparsity.sh`):
 
-| dtype | mode | zero % | ms | TFLOPS |
-|---|---|---:|---:|---:|
-| fp16 | plain | 0 | 17.144 | 32.07 |
-| fp16 | zero | 100 | 14.215 | 38.67 |
-| f8f8 | **plain** | **0** | **9.335** | **58.89** |
-| f8f8 | zero | 100 | 7.676 | 71.62 |
-| f8f8 | act | 0 | 9.013 | 61.00 |
-| f8f8 | act | 25 | 8.889 | 61.85 |
-| f8f8 | act | 50 | 8.543 | 64.35 |
-| f8f8 | **act** | **75** | **7.656** | **71.81** |
-| f8f8 | act | 90 | 7.732 | 71.10 |
-| f8f8 | w | 50 | 6.944 | 79.17 |
-| f8f8 | w | 75 | 6.007 | 91.52 |
-| f8f8 | w24 | 50 | 7.007 | 78.45 |
+| Sparsity | spec | ms | FP8 TFLOPS |
+|---|---|---:|---:|
+| **Dense** | | | |
+| Dense random, signed | `plain:0` | 9.85 | **55.8** |
+| Dense, all positive (bias + ReLU, no zeros) | `act:0` | 9.21 | **59.7** |
+| **Activation sparsity** | | | |
+| Activations, 25% zero | `act:0.25` | 8.92 | 61.7 |
+| Activations, 50% zero | `act:0.5` | 8.21 | 67.0 |
+| Activations, 75% zero (3:1) | `act:0.75` | 7.66 | **71.8** |
+| Activations, 90% zero | `act:0.9` | 7.64 | 72.0 |
+| Activations, 100% zero (zero input) | `zero:0` | 8.08 | 68.1 |
+| **Weight sparsity** | | | |
+| Weights, 50% zero, random positions | `w:0.5` | 6.95 | 79.1 |
+| Weights, 50% zero, 2-of-4 structured | `w24:0.5` | 7.15 | 76.9 |
+| Weights, 75% zero, random positions | `w:0.75` | 6.01 | **91.4** |
+| **Joint weight + activation sparsity** | | | |
+| All-positive activations + 50% zero weights | `act:0:0.5` | 6.64 | 82.8 |
+| All-positive activations + 75% zero weights | `act:0:0.75` | 5.87 | 93.7 |
+| 50% zero activations + 50% zero weights | `act:0.5:0.5` | 6.12 | 89.9 |
+| 75% zero activations + 50% zero weights | `act:0.75:0.5` | 5.84 | 94.2 |
+| 50% zero activations + 75% zero weights | `act:0.5:0.75` | 5.74 | **95.7** |
+| 75% zero activations + 75% zero weights | `act:0.75:0.75` | 5.76 | 95.4 |
+| 90% zero activations + 90% zero weights | `act:0.9:0.9` | 5.75 | 95.6 |
 
-- **Dense FP8 conv2d is about 57–59 TFLOPs**, 1.8× dense FP16 (32).
-- **72 TFLOPs needs about 75% zero activations** (3 of every 4). Speed rises from 0% to 75% zeros, then flattens at about 72; 90% and 100% zeros are no faster.
-- **Zero weights go past that plateau.** 75% zero weights reach 92 TFLOPs dense-equivalent. That points to the ANE skipping zero-weight work outright, and random zeros do about as well as 2-of-4 structured ones.
+- **Dense FP8 conv2d is about 56–60 TFLOPs.** Signed random data is the low end. All-positive data with no zeros runs about 5% faster, probably because the sign bit never flips, so fewer bits toggle.
+- **72 TFLOPs needs about 75% zero activations** (3 of every 4). Speed rises from 0% to 75% zeros, then flattens at about 72. The 100%-zero row landed lower in this pass (68); on a cooler machine it measured 71.6–71.9.
+- **Zero weights go past that plateau.** 75% zero weights reach 91 TFLOPs dense-equivalent. That points to the ANE skipping zero-weight work outright, and random zeros do about as well as 2-of-4 structured ones.
+- **Joint sparsity tops out at about 95 TFLOPs.** 50% + 50% already reaches 90. From 50/75 up to 90/90 the time stays at 5.75 ms, even though at 90/90 about 99% of the multiplies involve a zero. Beyond that point the limit isn't the math; it's a fixed per-layer cost (about 22 µs per layer), memory traffic or the pipeline.
 - **For activations, skipping and power savings look the same from here.** Zeros may be skipped, or may just draw less power so the clock stays higher; the flat top at about 72 fits a clock or pipeline limit. Not confirmed.
-- **The `act:0` row (61) is slightly faster than `plain` (59).** Its activations are all positive after the ReLU, which probably toggles fewer bits.
 - **Making the work bigger doesn't reach 72 on dense data.** An ad-hoc sweep with random input (not in the repo) measured 52–55 TFLOPs for 768 or 1024 channels, 64×128 spatial, batch 2, and two independent parallel chains in one model. With zero input, the same shapes reached 71–76. Larger dense runs got slower, not faster, which points to a power or clock limit rather than unused capacity.
-- `conv2d` and `nn.Linear` (matmul) chains time the same, in both `f8f8` and `fp16`.
+- `conv2d` and `nn.Linear` (matmul) FP8 chains time the same.
 
-Timings vary by 5–10% with temperature. After about 15 minutes of back-to-back ANE runs, `plain` measured 54.5 and `act:0.75` measured 67.6. Let the machine cool before comparing rows.
+Timings vary by 5–10% with temperature. On a cool machine `plain` measured up to 58.9, while after about 15 minutes of back-to-back ANE runs it dropped to 54. Let the machine cool before comparing rows.
 
 Reproduce:
 
 ```bash
 cd coreai
-./bench_sparsity.sh                               # full f8f8 sweep above (~3.5 min cold, models cached after)
+./bench_sparsity.sh                               # every f8f8 row above (~6 min cold, models cached after)
 ./bench_sparsity.sh plain:0 act:0.75              # pick modes, MODE:P with P = zero fraction
-./bench_sparsity.sh --dtype fp16 plain:0 zero:0   # FP16 baseline
+./bench_sparsity.sh act:0:0.75 act:0.5:0.5        # joint: act:P:Q = P zero activations + Q zero weights
 ./bench_sparsity.sh --stack 128 act:0.5           # other depths
 ```
 
