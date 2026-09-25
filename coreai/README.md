@@ -100,7 +100,9 @@ Caveats: timings are host wall-clock (median of 10 after 3 warmup), not GPU time
 
 ## ANE FP8 conv-chain: 72 TFLOPs on M6 (reproduce)
 
-`bench_stacked.py` packs `S` sequential bias-free `nn.Linear(ch, ch)` layers into one `.aimodel`. A 1×1 conv over `N = sp·sp` activations is identical to `nn.Linear(ch, ch)`, so `--shapes conv512` is `N=4096, K=512, M=512` (`sp=64`). `f8f8` is FP8 E4M3FN weights **and** activations (symmetric per-tensor) → IR `dequant → fp16 broadcasting_batch_matmul`: FP8 is the 1-byte **storage** format and the MAC runs FP16, the same activation-bandwidth trick as the INT8 W8A8 gist.
+> **The 72 TFLOPs here is a zero-activation number.** `bench_stacked.py` uses PyTorch's default `nn.Linear` init, which shrinks activations at every layer. After 256 layers every activation is exactly 0 (the output is 0 in all 2,097,152 elements), and the ANE runs faster on zeros. With dense random activations the same chain runs at **about 57 TFLOPs**. See [ANE sparsity](#ane-sparsity-what-the-72-tflops-needs) below.
+
+`bench_stacked.py` packs `S` sequential bias-free `nn.Linear(ch, ch)` layers into one `.aimodel`. A 1×1 conv over `N = sp·sp` activations is identical to `nn.Linear(ch, ch)`, so `--shapes conv512` is `N=4096, K=512, M=512` (`sp=64`). `f8f8` is FP8 E4M3FN weights **and** activations (symmetric per-tensor) → IR `dequant → fp16 broadcasting_batch_matmul`. In the IR, FP8 is the 1-byte storage format and the matmul operands are FP16. On dense data, though, `f8f8` still runs about 1.8× faster than `fp16` on the ANE, so the backend compiler gains something from FP8 below the IR (FP8 MACs or halved activation traffic; the IR doesn't show which).
 
 Confirmed on **Apple M6** (Mac18,5), ANE preferred:
 
@@ -131,3 +133,62 @@ Or use the wrapper, which defaults to the same row and prints a clean table (`dt
 `--compute ane` is preference-only, but placement is real on M6: the same `conv512` S=256 `f8f8` config with `--compute gpu` ran **27.47 ms / 20.02 TFLOPS**, so the ANE row is **3.60×** faster. Results are written to `results_stacked_ane.txt` and `results.md`; assets are cached in `artifacts_stacked/`.
 
 Note: this is a chip difference from the M5 Max section above, where `f8f8` did **not** specialize on the ANE and fell back to the GPU. On M6 the FP8 chain lands on the ANE.
+
+All rows in the table above ran with all-zero activations (default init), including the 128-layer FP16 row.
+
+## ANE sparsity: what the 72 TFLOPs needs
+
+![ANE sparsity support, from Apple patents US11120327B2 (weight sparsity) and US20260057227A1 (activation sparsity)](assets/ane-sparsity-support-infographic.png)
+
+The mechanisms above come from patent descriptions, not a confirmed description of shipping silicon. In the patents, weight zeros are packed out and skipped at the MAC. Activation zeros are skipped per work-unit tile, only when a whole tile is zero. The measurements below fit the weight side well. On the activation side, zeros scattered at random still sped things up, even though they rarely fill a whole tile. That suggests part of the activation gain comes from power or clock rather than skipped tiles.
+
+`bench_sparsity.py` runs a real `nn.Conv2d(512, 512, 1)` chain: input `(1, 512, 64, 64)`, 256 layers, the same work as `conv512`, with the IR lowering to `coreai.conv2d`. The weights are orthogonal, so activations keep unit scale through all 256 layers instead of decaying to zero. Each mode controls where the zeros are:
+
+| mode | what is zero |
+|---|---|
+| `plain:0` | nothing: dense random activations |
+| `zero:0` | the input, so every activation is 0 |
+| `act:P` | fraction `P` of activations at **every** layer (conv + bias + ReLU, bias calibrated per layer, rescaled to unit RMS) |
+| `w:P` | fraction `P` of weights, random positions |
+| `w24:P` | `P` of every 4 consecutive input-channel weights (structured) |
+
+TFLOPS is dense-equivalent: `2·N·C·C·S / wall_clock`, with zeros counted as work.
+
+Apple M6, ANE preferred, conv512, 256 layers, median of 50:
+
+| dtype | mode | zero % | ms | TFLOPS |
+|---|---|---:|---:|---:|
+| fp16 | plain | 0 | 17.144 | 32.07 |
+| fp16 | zero | 100 | 14.215 | 38.67 |
+| f8f8 | **plain** | **0** | **9.335** | **58.89** |
+| f8f8 | zero | 100 | 7.676 | 71.62 |
+| f8f8 | act | 0 | 9.013 | 61.00 |
+| f8f8 | act | 25 | 8.889 | 61.85 |
+| f8f8 | act | 50 | 8.543 | 64.35 |
+| f8f8 | **act** | **75** | **7.656** | **71.81** |
+| f8f8 | act | 90 | 7.732 | 71.10 |
+| f8f8 | w | 50 | 6.944 | 79.17 |
+| f8f8 | w | 75 | 6.007 | 91.52 |
+| f8f8 | w24 | 50 | 7.007 | 78.45 |
+
+- **Dense FP8 conv2d is about 57–59 TFLOPs**, 1.8× dense FP16 (32).
+- **72 TFLOPs needs about 75% zero activations** (3 of every 4). Speed rises from 0% to 75% zeros, then flattens at about 72; 90% and 100% zeros are no faster.
+- **Zero weights go past that plateau.** 75% zero weights reach 92 TFLOPs dense-equivalent. That points to the ANE skipping zero-weight work outright, and random zeros do about as well as 2-of-4 structured ones.
+- **For activations, skipping and power savings look the same from here.** Zeros may be skipped, or may just draw less power so the clock stays higher; the flat top at about 72 fits a clock or pipeline limit. Not confirmed.
+- **The `act:0` row (61) is slightly faster than `plain` (59).** Its activations are all positive after the ReLU, which probably toggles fewer bits.
+- **Making the work bigger doesn't reach 72 on dense data.** An ad-hoc sweep with random input (not in the repo) measured 52–55 TFLOPs for 768 or 1024 channels, 64×128 spatial, batch 2, and two independent parallel chains in one model. With zero input, the same shapes reached 71–76. Larger dense runs got slower, not faster, which points to a power or clock limit rather than unused capacity.
+- `conv2d` and `nn.Linear` (matmul) chains time the same, in both `f8f8` and `fp16`.
+
+Timings vary by 5–10% with temperature. After about 15 minutes of back-to-back ANE runs, `plain` measured 54.5 and `act:0.75` measured 67.6. Let the machine cool before comparing rows.
+
+Reproduce:
+
+```bash
+cd coreai
+./bench_sparsity.sh                               # full f8f8 sweep above (~3.5 min cold, models cached after)
+./bench_sparsity.sh plain:0 act:0.75              # pick modes, MODE:P with P = zero fraction
+./bench_sparsity.sh --dtype fp16 plain:0 zero:0   # FP16 baseline
+./bench_sparsity.sh --stack 128 act:0.5           # other depths
+```
+
+Models are cached in `artifacts_sparsity/`; pass `--force` to rebuild them.
