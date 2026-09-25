@@ -1,4 +1,5 @@
 
+
 ## Stacked GEMM call-overhead (JIT ANE)
 
 # Core AI stacked GEMM call-overhead — compute=ane (JIT)
@@ -17,7 +18,7 @@
 IR: f8f8 quant around fp16 (dequant → broadcasting_batch_matmul fp16)
    S    median_ms  status
 ----------------------------------------
- 256       7.5958  OK
+ 256       7.6064  OK
 
 ## Summary table
 dtype  shape        T1_ms      T4_ms     T16_ms     T32_ms  T_call_ms  T_kern_ms kern_TF/TOPS  T1_TF/TOPS  IR

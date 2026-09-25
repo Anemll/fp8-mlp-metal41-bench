@@ -120,6 +120,14 @@ unset USE_LOCAL_COREAI
 uv run python bench_stacked.py --compute ane --dtypes f8f8 --shapes conv512 --stacks 256
 ```
 
+Or use the wrapper, which defaults to the same row and prints a clean table (`dtype shape S median_ms status tflops`):
+
+```bash
+./bench_ane.sh                 # conv512, 256 layers, f8f8, ANE ~72 TFLOPs
+./bench_ane.sh --stacks 128    # 128 layers
+./bench_ane.sh --compute gpu --stacks 256   # GPU comparison
+```
+
 `--compute ane` is preference-only, but placement is real on M6: the same `conv512` S=256 `f8f8` config with `--compute gpu` ran **27.47 ms / 20.02 TFLOPS**, so the ANE row is **3.60×** faster. Results are written to `results_stacked_ane.txt` and `results.md`; assets are cached in `artifacts_stacked/`.
 
 Note: this is a chip difference from the M5 Max section above, where `f8f8` did **not** specialize on the ANE and fell back to the GPU. On M6 the FP8 chain lands on the ANE.
